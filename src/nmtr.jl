@@ -39,12 +39,11 @@ end
 function SciMLBase.__init(prob::OptimizationProblem, opt::NonMonotoneTrustRegion;
                           maxiters::Number = 1000, callback = (args...) -> (false),
                           progress = false, save_best = true,
-                          noise_level=zero(eltype(prob.u0)), 
+                          initial_radius=nothing,
                           initial_hessian = Matrix{eltype(prob.u0)}(I,length(prob.u0),length(prob.u0)),
-                          max_stalls=2,
                           kwargs...)
     return OptimizationCache(prob, opt; maxiters, callback, progress,
-                             save_best, max_stalls, initial_hessian, kwargs...)
+                             save_best, initial_radius, initial_hessian ,kwargs...)
 end
 
 function eval_val_and_grad!(cache::OptimizationCache,g,x)
@@ -355,10 +354,14 @@ end
 #   end
 #   return -(dot(gr,p) + 0.5 * dot(p,H,p))
 # end
-function step_back(x,s,lb,ub,θ)
+function step_back!(x,s,lb,ub,θ)
     τ,ind = findmin(
         iszero(s[i]) ? typemax(s[i]) : max((ub[i]-nextfloat(x[i]))/s[i],(lb[i]-prevfloat(x[i]))/s[i]) for i in eachindex(x))
-    return ind, min(one(τ),θ*τ)
+    α = min(one(τ),θ*τ)
+    for i in eachindex(s)
+        s[i] *= α
+    end
+    return α < one(τ) ? ind : nothing
 end
 
 function update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
@@ -381,6 +384,24 @@ function update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
     nothing
 end
 
+function solve_1d_tr_subproblem!(g,H,delta,s,shift)
+    γ = - (dot(g,s) + 2*dot(s,H,shift)) / dot(s,H,s)
+    α = min(γ,(delta-norm(shift)) / norm(s))
+    for i in eachindex(s)
+        s[i] *= α
+    end
+    return
+end
+
+function solve_1d_tr_subproblem!(g,H,delta,s)
+    γ = - dot(g,s) / dot(s,H,s)
+    α = min(γ,delta / norm(s))
+    for i in eachindex(s)
+        s[i] *= α
+    end
+    return
+end
+
 function solve_tr_subproblem!(gr::T,H::AbstractMatrix{W}, delta::W,
                               s::T,x::T,lb::T,ub::T,sqrt_abs_scale,dscale,θ) where {W,T<:AbstractVector{W}}
 
@@ -390,46 +411,41 @@ function solve_tr_subproblem!(gr::T,H::AbstractMatrix{W}, delta::W,
     gs = Dinv*gr
     Cs = Diagonal(gr .* dscale)
     Hs = Dinv*H*Dinv + Cs
-    
+
     C = Diagonal(gr .* dscale ./ (sqrt_abs_scale .^ 2))
-
+    
     solve_tr_subproblem!(gs,Hs,delta,s)
-
     # Undo the scaling
     for i in eachindex(s)
         s[i] *= sqrt_abs_scale[i]
     end
 
-
-    outside_ind,factor = step_back(x,s,lb,ub,θ)
-
     # Candidate points
-    ## Original step
-    r = copy(s)
-
     ## Truncated 
-    s .*= factor 
+    outside_ind = step_back!(x,s,lb,ub,θ)
 
     # Gradient
-    grad_s = - sqrt_abs_scale .^ 2 .* gr 
-    _,grad_factor = step_back(x,grad_s,lb,ub,θ)
-    grad_s .*= grad_factor
+    grad_s = -gs
+    solve_1d_tr_subproblem!(gs,Hs,delta,grad_s)
+    for i in eachindex(grad_s)
+        grad_s[i] *= sqrt_abs_scale[i]
+    end
+    step_back!(x,grad_s,lb,ub,θ)
 
     ## Reflection
-    cands = if factor != 1
-        r[outside_ind] *= -one(eltype(x))
-
-        reflected_a = dot(gr,r) + dot(s,H,r)
-        reflected_b = dot(r,H,r)
-        reflected_s = s - reflected_a/reflected_b * r
-
-        _,reflected_factor = step_back(x,reflected_s,lb,ub,θ)
-        reflected_s .*= reflected_factor
-
-        (s,grad_s,reflected_s)
-    else
-        (s,grad_s)
-    end
+    # cands = if !isnothing(outside_ind)
+    #     reflected_s = s ./ sqrt_abs_scale
+    #     reflected_s[outside_ind] *= -one(eltype(x))
+    #
+    #     solve_1d_tr_subproblem!(gs,Hs,delta,s ./ sqrt_abs_scale)
+    #     for i in eachindex(reflected_s)
+    #         reflected_s[i] *= sqrt_abs_scale[i]
+    #     end
+    #     (s,grad_s,reflected_s)
+    # else
+    #     (s,grad_s)
+    # end
+    cands = (s,grad_s)
 
     m = map(cands) do v
         b = 0.5 * dot(v,C,v)
@@ -472,7 +488,6 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
     # Why these types cannot be infered?
     maxiters::Int = OptimizationBase._check_and_convert_maxiters(cache.solver_args.maxiters)
     abstol::uType,reltol::uType = _check_stopping_tol(uType,cache.solver_args)
-    max_stalls = cache.solver_args.max_stalls
 
     x = copy(cache.reinit_cache.u0)
     lb = if isnothing(cache.lb)
@@ -487,10 +502,11 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
     end
 
     if !all(lb .< x .< ub)
-        println("Warning! The initial guess is outside the given bounds. Clamping it...")
-        for i in eachindex(x)
-            x[i] = clamp(x[i],nextfloat(lb[i]),prevfloat(ub[i]))
-        end
+        center = (ub+lb)/2
+        s = x-center
+        _,factor = step_back(center,s,lb,ub,θmin)
+        x = center + factor*s
+        @warn "The initial guess is outside the given bounds. Clamping it..."  center s factor
     end
 
     gr = zero(x)
@@ -515,7 +531,11 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
     D = val
     ξ = ξ0
     prevξ = zero(uType)
-    Δ = one(uType)
+    Δ = if isnothing(cache.solver_args.initial_radius)
+        one(uType) / sqrt(dot(gr,H,gr))
+    else
+        uType(cache.solver_args.initial_radius)
+    end
     ρ = zero(uType)
 
     opt_state = OptimizationBase.OptimizationState(
@@ -546,18 +566,6 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
                 stop = true
                 break
             end
-            if Δ <= sqrt(eps(zero(uType)))
-                n_stalls += 1
-                if n_stalls >= max_stalls
-                    retcode = ReturnCode.StalledSuccess
-                    stop = true
-                    break
-                end
-                iden!(H)
-                Δ = one(uType)
-                trials = 0
-                continue
-            end
 
             trials += 1
             Δm,bound_augmentation = solve_tr_subproblem!(gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ)
@@ -565,24 +573,33 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
 
             copyto!(cand,x)
             cand .+= p
-            cand_val = eval_val_and_grad!(cache,cand_gr,cand)
 
+            if Δ <= sqrt(eps(zero(uType))) || x == cand
+                retcode = ReturnCode.StalledSuccess
+                stop = true
+                break
+            end
+
+            cand_val = eval_val_and_grad!(cache,cand_gr,cand)
             fevals += 1
             update_hessian!(H,y,val,gr,p,cand_val,cand_gr)
 
             ρ = if Δm > 0
-                (val-cand_val-bound_augmentation+δ)/(Δm+δ)
+                (D-cand_val-bound_augmentation+δ)/(Δm+δ)
             else
                 -one(uType)
             end
 
-            # @info "" iter Δ cand_val D ρ Δm ns ng bound_augmentation θ norm(x-cand) norm(gr-cand_gr)
-            
+            # @info "" iter Δ val cand_val D ρ Δm ns ng bound_augmentation θ norm(x-cand) norm(gr-cand_gr)
+
             # Update trust radius following 10.1137/030602563
             if ρ < c1
                 # Large reduction in trust region
                 Δ = min(α1^trials*Δ,ns/4)
-            elseif c1 <= ρ < c2
+                continue
+            end
+
+            if c1 <= ρ < c2
                 # Trust region slighly reduced if below c2
                 Δ *= α1 + ((ρ-c1)/(c2-c1))^2*(1-α1)
             else
@@ -593,10 +610,12 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
                 end
             end
 
-            # Nonmonotone contribution
-            if Δm > 0 && ρ + (D-val)/(Δm+δ) > c1
-                break
-            end
+            break
+
+            # # Nonmonotone contribution
+            # if Δm > 0 && ρ + (D-val)/(Δm+δ) > c1
+            #     break
+            # end
         end
 
         if stop break end
@@ -643,6 +662,6 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
 
 
     return SciMLBase.build_solution(cache, cache.opt, best_x, best_val;
-                                    stats,retcode)
+                                    stats,retcode,original = (;hess=H,Δ))
 end
 
