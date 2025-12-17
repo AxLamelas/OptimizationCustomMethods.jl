@@ -6,7 +6,7 @@ using LinearAlgebra
 
 # Non-monotonicity from 10.1007/s00186-025-00904-4
 # Noise tolerance from 10.48550/arXiv.2201.00973
-# Parameters and bound constraints from 10.1371/journal.pcbi.1010322
+# Bound constraints from 10.1137/0806023
 struct NonMonotoneTrustRegion 
   c1::Float64
   c2::Float64
@@ -356,7 +356,7 @@ end
 # end
 function step_back!(x,s,lb,ub,θ)
     τ,ind = findmin(
-        iszero(s[i]) ? typemax(s[i]) : max((ub[i]-nextfloat(x[i]))/s[i],(lb[i]-prevfloat(x[i]))/s[i]) for i in eachindex(x))
+        iszero(s[i]) ? typemax(s[i]) : max((prevfloat(ub[i])-x[i])/s[i],(nextfloat(lb[i])-x[i])/s[i]) for i in eachindex(x))
     α = min(one(τ),θ*τ)
     for i in eachindex(s)
         s[i] *= α
@@ -369,13 +369,13 @@ function update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
     for i in eachindex(x)
         sqrt_abs_scale[i], dscale[i] = if gr[i] < 0 
             if isfinite(ub[i])
-                sqrt(ub[i]-x[i]), -one(T)
+                sqrt(prevfloat(ub[i])-x[i]), -one(T)
             else
                 one(T), zero(T)
             end
         else
             if isfinite(lb[i])
-                sqrt(x[i] - lb[i]), one(T)
+                sqrt(x[i] - nextfloat(lb[i])), one(T)
             else
                 one(T), zero(T)
             end
