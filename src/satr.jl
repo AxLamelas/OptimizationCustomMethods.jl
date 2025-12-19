@@ -1,13 +1,22 @@
+module SATR
+# Bound constraints from 10.1137/0806023
+# Trust region radius update from 10.1137/030602563
+
+# Possible to use but disable by default
+# Non-monotonicity from 10.1007/s00186-025-00904-4
+# Noise tolerance from 10.48550/arXiv.2201.00973
+
+export SelfAdaptiveTR
+
 using SciMLBase
 using OptimizationBase: OptimizationCache
 using OptimizationBase
 using Random
 using LinearAlgebra
 
-# Non-monotonicity from 10.1007/s00186-025-00904-4
-# Noise tolerance from 10.48550/arXiv.2201.00973
-# Bound constraints from 10.1137/0806023
-struct NonMonotoneTrustRegion 
+include("common.jl")
+
+struct SelfAdaptiveTR 
   c1::Float64
   c2::Float64
   α1::Float64
@@ -21,22 +30,22 @@ struct NonMonotoneTrustRegion
   ϵ::Float64
 end
 
-SciMLBase.has_init(opt::NonMonotoneTrustRegion) = true
-SciMLBase.allowscallback(opt::NonMonotoneTrustRegion) = true
-SciMLBase.requiresgradient(opt::NonMonotoneTrustRegion) = true
-SciMLBase.allowsbounds(opt::NonMonotoneTrustRegion) = true
-SciMLBase.allowsfg(opt::NonMonotoneTrustRegion) = true
+SciMLBase.has_init(opt::SelfAdaptiveTR) = true
+SciMLBase.allowscallback(opt::SelfAdaptiveTR) = true
+SciMLBase.requiresgradient(opt::SelfAdaptiveTR) = true
+SciMLBase.allowsbounds(opt::SelfAdaptiveTR) = true
+SciMLBase.allowsfg(opt::SelfAdaptiveTR) = true
 
 
-function NonMonotoneTrustRegion(; 
-                                c1 = 1e-4, c2 = 0.9,
-                                α1 = 0.5, α2 = 2., α3 = 1.05, r = 0.9,
-                                θmin = 0.95, ξ0 = 0.85,ϵ=0.)
-    NonMonotoneTrustRegion(c1,c2,α1,α2,α3,θmin,r,ξ0,ϵ)
+function SelfAdaptiveTR(; 
+                                c1 = 1e-4, c2 = 0.95,
+                                α1 = 0.25, α2 = 3.5, α3 = 1.05, r = 0.9,
+                                θmin = 0.95, ξ0 = 0.,ϵ=0.)
+    SelfAdaptiveTR(c1,c2,α1,α2,α3,θmin,r,ξ0,ϵ)
 end
 
 
-function SciMLBase.__init(prob::OptimizationProblem, opt::NonMonotoneTrustRegion;
+function SciMLBase.__init(prob::OptimizationProblem, opt::SelfAdaptiveTR;
                           maxiters::Number = 1000, callback = (args...) -> (false),
                           progress = false, save_best = true,
                           initial_radius=nothing,
@@ -46,34 +55,16 @@ function SciMLBase.__init(prob::OptimizationProblem, opt::NonMonotoneTrustRegion
                              save_best, initial_radius, initial_hessian ,kwargs...)
 end
 
-function eval_val_and_grad!(cache::OptimizationCache,g,x)
-  if cache.f.fg !== nothing
-    first(cache.f.fg(g,x,cache.p))
-  else
-    cache.f.grad(g,x,cache.p)
-    cache.f(x,cache.p)
-  end
-end
-
-function iden!(M::AbstractMatrix{T}) where T
-         for I in CartesianIndices(M)
-           if I[1] == I[2]
-             M[I] = one(T)
-           else
-             M[I] = zero(T)
-           end
-         end
-       end
-
-
 function update_hessian!(H,y,prev_val,prev_grad,p,val,grad)
     # Modified BFGS from 10.1007/s10589-008-9219-0
     ρ = 2*(prev_val-val) + dot(grad,p) + dot(prev_grad,p)
     n = max(ρ,0)/dot(p,p) 
-    @. y = grad - prev_grad + n * p
+    for i in eachindex(y)
+        y[i] = grad[i] - prev_grad[i] + n * p[i]
+    end
     c = dot(p,y)
 
-    if isnan(c) || c <= eps(val) return end
+    if isnan(c) || c <= 1e-8*norm(p)*norm(y) return end
 
     Bp = H * p
     mul!(H,y,y',1/c,1)
@@ -471,7 +462,8 @@ function _check_stopping_tol(T::Type,solver_args)
   return T(solver_args.abstol), T(solver_args.reltol)
 end
 
-function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneTrustRegion}
+box = Ref{Any}()
+function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: SelfAdaptiveTR}
     uType = eltype(cache.reinit_cache.u0)
     c1 = uType(cache.opt.c1)
     c2 = uType(cache.opt.c2)
@@ -504,9 +496,9 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
     if !all(lb .< x .< ub)
         center = (ub+lb)/2
         s = x-center
-        _,factor = step_back(center,s,lb,ub,θmin)
-        x = center + factor*s
-        @warn "The initial guess is outside the given bounds. Clamping it..."  center s factor
+        step_back!(center,s,lb,ub,θmin)
+        x = center + s
+        @warn "The initial guess is outside the given bounds. Clamping it..."  center s
     end
 
     gr = zero(x)
@@ -532,21 +524,20 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
     ξ = ξ0
     prevξ = zero(uType)
     Δ = if isnothing(cache.solver_args.initial_radius)
-        one(uType) / sqrt(dot(gr,H,gr))
+        0.1*sqrt(dot(gr,H,gr))
     else
         uType(cache.solver_args.initial_radius)
     end
     ρ = zero(uType)
 
     opt_state = OptimizationBase.OptimizationState(
-        ; iter=0, u = x, objective = val, grad = gr, hess = H, original = (;Δ,D,ρ), p = cache.p)
+        ; iter=0, u = x, objective = val, grad = gr, hess = H, original = (;Δ,D,ρ,lb,ub), p = cache.p)
     cb_call = cache.callback(opt_state, val)
 
     fevals = 1
     iterations = 0
     t0 = time()
     retcode = ReturnCode.MaxIters
-    stop = false
     @inbounds for iter in 1:maxiters
         # Optimizality condition takes the scaling into account
         ng = norm(sqrt_abs_scale .^ 2 .* gr,Inf)
@@ -560,6 +551,7 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
 
         n_stalls = 0
         trials = 0
+        stop = false
         while true
             if isnan(Δ)
                 retcode = ReturnCode.Failure
@@ -567,6 +559,7 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
                 break
             end
 
+            box[] = (cache,gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ,cand_val,cand,cand_gr)
             trials += 1
             Δm,bound_augmentation = solve_tr_subproblem!(gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ)
             ns = norm(p ./ sqrt_abs_scale)
@@ -585,21 +578,17 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
             update_hessian!(H,y,val,gr,p,cand_val,cand_gr)
 
             ρ = if Δm > 0
-                (D-cand_val-bound_augmentation+δ)/(Δm+δ)
+                (val-cand_val-bound_augmentation+δ)/(Δm+δ)
             else
                 -one(uType)
             end
 
             # @info "" iter Δ val cand_val D ρ Δm ns ng bound_augmentation θ norm(x-cand) norm(gr-cand_gr)
 
-            # Update trust radius following 10.1137/030602563
             if ρ < c1
                 # Large reduction in trust region
-                Δ = min(α1^trials*Δ,ns/4)
-                continue
-            end
-
-            if c1 <= ρ < c2
+                Δ = min(α1*Δ,ns/4)
+            elseif c1 <= ρ < c2
                 # Trust region slighly reduced if below c2
                 Δ *= α1 + ((ρ-c1)/(c2-c1))^2*(1-α1)
             else
@@ -610,12 +599,10 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
                 end
             end
 
-            break
-
-            # # Nonmonotone contribution
-            # if Δm > 0 && ρ + (D-val)/(Δm+δ) > c1
-            #     break
-            # end
+            # NonMonotone contribution
+            if ρ + (D-val)/(Δm+δ) > c1 && Δm > 0
+                break
+            end
         end
 
         if stop break end
@@ -638,7 +625,7 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
         # Callback
         opt_state = OptimizationBase.OptimizationState(
             ; iter=iterations, u = x, objective = val, grad = gr, hess = H, p = cache.p, 
-            original = (;Δ,D,ρ)
+            original = (;Δ,D,ρ,lb,ub)
         )
         cb_call = cache.callback(opt_state, val)
         if !(cb_call isa Bool)
@@ -665,3 +652,4 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: NonMonotoneT
                                     stats,retcode,original = (;hess=H,Δ))
 end
 
+end

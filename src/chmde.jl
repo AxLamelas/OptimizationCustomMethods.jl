@@ -1,4 +1,7 @@
+module CHMDE
 # Clustering Hybrid MDE from 10.1016/j.cor.2020.105165
+
+export ClusteringHybredMDE
 
 using SciMLBase
 using OptimizationBase: OptimizationCache
@@ -9,6 +12,8 @@ using QuasiMonteCarlo
 using SpecialFunctions
 using SparseArrays
 using Statistics
+
+include("common.jl")
 
 struct ClusteringHybridMDE{S}
   F::Float64
@@ -276,4 +281,5 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: ClusteringHy
 
   return SciMLBase.build_solution(cache, cache.opt, best_x, best_val;
                                   stats,retcode,original=(;population,population_vals))
+end
 end
