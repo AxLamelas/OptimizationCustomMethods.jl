@@ -484,12 +484,13 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: AdaptiveNonM
     y = zero(x)
     sqrt_abs_scale = zero(x)
     dscale = zero(x)
-    best_val = typemax(uType)
-    best_x = copy(x)
 
     val = eval_val_and_grad!(cache,gr,x)
     H = copy(cache.solver_args.initial_hessian)
     update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
+
+    best_val = val
+    best_x = copy(x)
 
     if size(H) != (length(x),length(x))
         throw(error("Initial hessian does not have the correct dimensions!"))

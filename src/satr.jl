@@ -508,12 +508,13 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: SelfAdaptive
     y = zero(x)
     sqrt_abs_scale = zero(x)
     dscale = zero(x)
-    best_val = typemax(uType)
-    best_x = copy(x)
 
     val = eval_val_and_grad!(cache,gr,x)
     H = copy(cache.solver_args.initial_hessian)
     update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
+
+    best_val = val
+    best_x = copy(x)
 
     if size(H) != (length(x),length(x))
         throw(error("Initial hessian does not have the correct dimensions!"))
@@ -559,7 +560,7 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: SelfAdaptive
                 break
             end
 
-            box[] = (cache,gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ,cand_val,cand,cand_gr)
+            # box[] = (cache,gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ,cand_val,cand,cand_gr)
             trials += 1
             Δm,bound_augmentation = solve_tr_subproblem!(gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ)
             ns = norm(p ./ sqrt_abs_scale)
