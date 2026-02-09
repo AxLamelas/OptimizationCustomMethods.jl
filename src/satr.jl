@@ -16,7 +16,7 @@ using LinearAlgebra
 
 include("common.jl")
 
-struct SelfAdaptiveTR 
+struct SelfAdaptiveTR
   c1::Float64
   c2::Float64
   α1::Float64
@@ -483,12 +483,12 @@ function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: SelfAdaptive
 
     x = copy(cache.reinit_cache.u0)
     lb = if isnothing(cache.lb)
-        fill(typemin(x),length(x))
+      fill(typemin(eltype(x)),length(x))
     else
         cache.lb
     end
     ub = if isnothing(cache.ub)
-        fill(typemax(x),length(x))
+      fill(typemax(eltype(x)),length(x))
     else
         cache.ub
     end
