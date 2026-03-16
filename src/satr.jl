@@ -67,9 +67,19 @@ function update_hessian!(H,y,prev_val,prev_grad,p,val,grad)
     if isnan(c) || c <= 1e-8*norm(p)*norm(y) return end
 
     Bp = H * p
+	pBp = dot(p,Bp)
+
+	if c < 0.2pBp
+		# Damping
+		θ = 0.8pBp/(pBp-c)
+		for i in eachindex(y)
+			y[i] = θ*y[i] + (1-θ)*Bp[i]
+		end
+	end
+
     mul!(H,y,y',1/c,1)
-    mul!(H,Bp,Bp',-1/dot(p,Bp),1)
-    
+    mul!(H,Bp,Bp',-1/pBp,1)
+
     return
 end
 
@@ -462,195 +472,202 @@ function _check_stopping_tol(T::Type,solver_args)
   return T(solver_args.abstol), T(solver_args.reltol)
 end
 
-box = Ref{Any}()
+# box = Ref{Any}()
 function SciMLBase.__solve(cache::OptimizationCache{O}) where {O <: SelfAdaptiveTR}
-    uType = eltype(cache.reinit_cache.u0)
-    c1 = uType(cache.opt.c1)
-    c2 = uType(cache.opt.c2)
-    α1 = uType(cache.opt.α1)
-    α2 = uType(cache.opt.α2)
-    α3 = uType(cache.opt.α3)
-    r = uType(cache.opt.r)
-    θmin = uType(cache.opt.θmin)
-    ξ0 = uType(cache.opt.ξ0)
-    ϵ = uType(cache.opt.ϵ)
+	uType = eltype(cache.reinit_cache.u0)
+	c1 = uType(cache.opt.c1)
+	c2 = uType(cache.opt.c2)
+	α1 = uType(cache.opt.α1)
+	α2 = uType(cache.opt.α2)
+	α3 = uType(cache.opt.α3)
+	r = uType(cache.opt.r)
+	θmin = uType(cache.opt.θmin)
+	ξ0 = uType(cache.opt.ξ0)
+	ϵ = uType(cache.opt.ϵ)
 
-    δ = 2/(1-c2) * ϵ
+	δ = 2/(1-c2) * ϵ
 
-    # Why these types cannot be infered?
-    maxiters::Int = OptimizationBase._check_and_convert_maxiters(cache.solver_args.maxiters)
-    abstol::uType,reltol::uType = _check_stopping_tol(uType,cache.solver_args)
+	# Why these types cannot be infered?
+	maxiters::Int = OptimizationBase._check_and_convert_maxiters(cache.solver_args.maxiters)
+	abstol::uType,reltol::uType = _check_stopping_tol(uType,cache.solver_args)
 
-    x = copy(cache.reinit_cache.u0)
-    lb = if isnothing(cache.lb)
-      fill(typemin(eltype(x)),length(x))
-    else
-        cache.lb
-    end
-    ub = if isnothing(cache.ub)
-      fill(typemax(eltype(x)),length(x))
-    else
-        cache.ub
-    end
+	x = copy(cache.reinit_cache.u0)
+	lb = if isnothing(cache.lb)
+		fill(typemin(eltype(x)),length(x))
+	else
+		cache.lb
+	end
+	ub = if isnothing(cache.ub)
+		fill(typemax(eltype(x)),length(x))
+	else
+		cache.ub
+	end
 
-    if !all(lb .< x .< ub)
-        center = (ub+lb)/2
-        s = x-center
-        step_back!(center,s,lb,ub,θmin)
-        x = center + s
-        @warn "The initial guess is outside the given bounds. Clamping it..."  center s
-    end
+	if !all(lb .< x .< ub)
+		center = (ub+lb)/2
+		s = x-center
+		step_back!(center,s,lb,ub,θmin)
+		x = center + s
+		@warn "The initial guess is outside the given bounds. Clamping it..."  center s
+	end
 
-    gr = zero(x)
-    cand = zero(x)
-    cand_gr = zero(x)
-    p = zero(x)
-    y = zero(x)
-    sqrt_abs_scale = zero(x)
-    dscale = zero(x)
+	gr = zero(x)
+	cand = zero(x)
+	cand_gr = zero(x)
+	p = zero(x)
+	y = zero(x)
+	sqrt_abs_scale = zero(x)
+	dscale = zero(x)
 
-    val = eval_val_and_grad!(cache,gr,x)
-    H = copy(cache.solver_args.initial_hessian)
-    update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
+	val = eval_val_and_grad!(cache,gr,x)
+	H = copy(cache.solver_args.initial_hessian)
+	update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
 
-    best_val = val
-    best_x = copy(x)
+	best_val = val
+	best_x = copy(x)
 
-    if size(H) != (length(x),length(x))
-        throw(error("Initial hessian does not have the correct dimensions!"))
-    end
+	if size(H) != (length(x),length(x))
+		throw(error("Initial hessian does not have the correct dimensions!"))
+	end
 
-    cand_val = val
-    D = val
-    ξ = ξ0
-    prevξ = zero(uType)
-    Δ = if isnothing(cache.solver_args.initial_radius)
-        0.1*sqrt(dot(gr,H,gr))
-    else
-        uType(cache.solver_args.initial_radius)
-    end
-    ρ = zero(uType)
+	cand_val = val
+	D = val
+	ξ = ξ0
+	prevξ = zero(uType)
+	Δ = if isnothing(cache.solver_args.initial_radius)
+		0.1*norm(gr)
+	else
+		uType(cache.solver_args.initial_radius)
+	end
+	ρ = zero(uType)
 
-    opt_state = OptimizationBase.OptimizationState(
-        ; iter=0, u = x, objective = val, grad = gr, hess = H, original = (;Δ,D,ρ,lb,ub), p = cache.p)
-    cb_call = cache.callback(opt_state, val)
+	opt_state = OptimizationBase.OptimizationState(
+		; iter=0, u = x, objective = val, grad = gr, hess = H, original = (;Δ,D,ρ,lb,ub), p = cache.p)
+	cb_call = cache.callback(opt_state, val)
 
-    fevals = 1
-    iterations = 0
-    t0 = time()
-    retcode = ReturnCode.MaxIters
-    @inbounds for iter in 1:maxiters
-        # Optimizality condition takes the scaling into account
-        ng = norm(sqrt_abs_scale .^ 2 .* gr,Inf)
-        if ng < abstol || ng < reltol * abs(val) 
-            retcode = ReturnCode.Success
-            break
-        end
-        iterations += 1
+	max_resets = 3
+	n_resets = 0
+	fevals = 1
+	iterations = 0
+	t0 = time()
+	retcode = ReturnCode.MaxIters
+	@inbounds for iter in 1:maxiters
+		# Optimizality condition takes the scaling into account
+		ng = norm(sqrt_abs_scale .^ 2 .* gr,Inf)
+		if ng < abstol || ng < reltol * abs(val) 
+			retcode = ReturnCode.Success
+			break
+		end
+		iterations += 1
 
-        θ = max(θmin,1-ng)
+		θ = max(θmin,1-ng)
 
-        n_stalls = 0
-        trials = 0
-        stop = false
-        while true
-            if isnan(Δ)
-                retcode = ReturnCode.Failure
-                stop = true
-                break
-            end
+		n_stalls = 0
+		trials = 0
+		stop = false
+		while true
+			if isnan(Δ)
+				retcode = ReturnCode.Failure
+				stop = true
+				break
+			end
 
-            # box[] = (cache,gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ,cand_val,cand,cand_gr)
-            trials += 1
-            Δm,bound_augmentation = solve_tr_subproblem!(gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ)
-            ns = norm(p ./ sqrt_abs_scale)
+			# box[] = (cache,gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ,cand_val,cand,cand_gr)
+			trials += 1
+			Δm,bound_augmentation = solve_tr_subproblem!(gr,H,Δ,p,x,lb,ub,sqrt_abs_scale,dscale,θ)
+			ns = norm(p ./ sqrt_abs_scale)
 
-            copyto!(cand,x)
-            cand .+= p
+			copyto!(cand,x)
+			cand .+= p
 
-            if Δ <= sqrt(eps(zero(uType))) || x == cand
-                retcode = ReturnCode.StalledSuccess
-                stop = true
-                break
-            end
+			if Δ <= sqrt(eps(zero(uType))) || x == cand
+				if n_resets >= max_resets
+					retcode = ReturnCode.StalledSuccess
+					stop = true
+					break
+				end
+				n_resets += 1
+				iden!(H)
+				Δ = 0.1*norm(gr)
+			end
 
-            cand_val = eval_val_and_grad!(cache,cand_gr,cand)
-            fevals += 1
-            update_hessian!(H,y,val,gr,p,cand_val,cand_gr)
+			cand_val = eval_val_and_grad!(cache,cand_gr,cand)
+			fevals += 1
 
-            ρ = if Δm > 0
-                (val-cand_val-bound_augmentation+δ)/(Δm+δ)
-            else
-                -one(uType)
-            end
+			ρ = if Δm > 0
+				(val-cand_val-bound_augmentation+δ)/(Δm+δ)
+			else
+				-one(uType)
+			end
 
-            # @info "" iter Δ val cand_val D ρ Δm ns ng bound_augmentation θ norm(x-cand) norm(gr-cand_gr)
+			# @info "" iter Δ val cand_val D ρ Δm ns ng bound_augmentation θ norm(x-cand) norm(gr-cand_gr)
 
-            if ρ < c1
-                # Large reduction in trust region
-                Δ = min(α1*Δ,ns/4)
-            elseif c1 <= ρ < c2
-                # Trust region slighly reduced if below c2
-                Δ *= α1 + ((ρ-c1)/(c2-c1))^2*(1-α1)
-            else
-                if ns > r*Δ # Only increase if step is at the edge
-                    # For very successful iterations the radius is not increase
-                    # because of probable model missmatch
-                    Δ *= α3 + (α2-α3)*exp(-((ρ-1)/(c2-1))^2)
-                end
-            end
+			if ρ < c1
+				# Large reduction in trust region
+				Δ = min(α1*Δ,ns/4)
+			elseif c1 <= ρ < c2
+				# Trust region slighly reduced if below c2
+				Δ *= α1 + ((ρ-c1)/(c2-c1))^2*(1-α1)
+			else
+				if ns > r*Δ # Only increase if step is at the edge
+					# For very successful iterations the radius is not increase
+					# because of probable model missmatch
+					Δ *= α3 + (α2-α3)*exp(-((ρ-1)/(c2-1))^2)
+				end
+			end
 
-            # NonMonotone contribution
-            if ρ + (D-val)/(Δm+δ) > c1 && Δm > 0
-                break
-            end
-        end
+			# NonMonotone contribution
+			if ρ + (D-val)/(Δm+δ) > c1 && Δm > 0
+				break
+			end
+		end
 
-        if stop break end
+		if stop break end
 
-        # Update for next iter
-        val = cand_val
-        copyto!(x,cand)
-        copyto!(gr,cand_gr)
-        update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
-        D = (ξ*D+val)/(ξ+1)
-        ξ,prevξ = ξ/2 + prevξ/2,ξ
-
-
-        # Check best
-        if val < best_val 
-            best_val = val
-            copyto!(best_x,x)
-        end
-
-        # Callback
-        opt_state = OptimizationBase.OptimizationState(
-            ; iter=iterations, u = x, objective = val, grad = gr, hess = H, p = cache.p, 
-            original = (;Δ,D,ρ,lb,ub)
-        )
-        cb_call = cache.callback(opt_state, val)
-        if !(cb_call isa Bool)
-            error("The callback should return a boolean `halt` for whether to stop the optimization process. Please see the sciml_train documentation for information.")
-        elseif cb_call
-            retcode = ReturnCode.Terminated
-            stop = true
-            break
-        end
-    end
-
-    t1 = time()
-
-    stats = OptimizationBase.OptimizationStats(; iterations ,
-                                               time = t1-t0, fevals, gevals=fevals)
-
-    if !cache.solver_args.save_best
-        return SciMLBase.build_solution(cache, cache.opt, x, val;
-                                        stats,retcode)
-    end
+		# Update for next iter
+		update_hessian!(H,y,val,gr,p,cand_val,cand_gr)
+		val = cand_val
+		copyto!(x,cand)
+		copyto!(gr,cand_gr)
+		update_scaling!(sqrt_abs_scale,dscale,x,gr,lb,ub)
+		D = (ξ*D+val)/(ξ+1)
+		ξ,prevξ = ξ/2 + prevξ/2,ξ
 
 
-    return SciMLBase.build_solution(cache, cache.opt, best_x, best_val;
-                                    stats,retcode,original = (;hess=H,Δ))
+		# Check best
+		if val < best_val 
+			best_val = val
+			copyto!(best_x,x)
+		end
+
+		# Callback
+		opt_state = OptimizationBase.OptimizationState(
+			; iter=iterations, u = x, objective = val, grad = gr, hess = H, p = cache.p, 
+			original = (;Δ,D,ρ,lb,ub)
+		)
+		cb_call = cache.callback(opt_state, val)
+		if !(cb_call isa Bool)
+			error("The callback should return a boolean `halt` for whether to stop the optimization process. Please see the sciml_train documentation for information.")
+		elseif cb_call
+			retcode = ReturnCode.Terminated
+			stop = true
+			break
+		end
+	end
+
+	t1 = time()
+
+	stats = OptimizationBase.OptimizationStats(; iterations ,
+											time = t1-t0, fevals, gevals=fevals)
+
+	if !cache.solver_args.save_best
+		return SciMLBase.build_solution(cache, cache.opt, x, val;
+								  stats,retcode)
+	end
+
+
+	return SciMLBase.build_solution(cache, cache.opt, best_x, best_val;
+								 stats,retcode,original = (;hess=H,Δ))
 end
 
 end
